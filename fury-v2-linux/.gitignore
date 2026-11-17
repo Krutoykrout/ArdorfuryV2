@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+Fury V2 Linux.desktop
+profiles.json
+*.lock
+assets/skins/
+assets/ru.xml
+assets/default.pbin
+preview/
