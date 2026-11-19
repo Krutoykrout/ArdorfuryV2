@@ -18,6 +18,28 @@ class ProtocolTests(unittest.TestCase):
                     [[t, p.hex()] for t, p in build_packets(v["profile"])], v["packets"]
                 )
 
+    def test_cycle_actions_use_vendor_named_actions(self):
+        # Independent semantic fixture: original action IDs 6 (dpi_cycle_text)
+        # and 50 (light_mode_switch_text), not IDs inferred from our wire map.
+        p = default_profile()
+        p["macros"] = [
+            dict(
+                id="1" * 32,
+                name="Copy",
+                repeat=1,
+                events=[
+                    dict(key="C", kind="down", delay=50),
+                    dict(key="C", kind="up", delay=50),
+                ],
+            )
+        ]
+        p["buttons"][3] = dict(macro="1" * 32, mode="count")
+        packets = build_packets(p, ("buttons",))
+        self.assertEqual(packets[1][1][20:28], bytes.fromhex("070003000b000000"))
+        self.assertEqual(packets[1][1][12:16], bytes.fromhex("09000100"))
+        expected = json.loads((ROOT / "tests/cycle-actions-vector.json").read_text())
+        self.assertEqual([[k, b.hex()] for k, b in packets], expected)
+
     def test_scoped_apply(self):
         for group, allowed in [
             ("performance", {1, 11, 16, 17, 8}),

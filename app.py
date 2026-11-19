@@ -45,6 +45,7 @@ from core import (
     action_label,
 )
 from usb_device import discover, Device
+from linux_settings import GnomeMouseSettings, SettingsError, ACCELERATION
 from macros import (
     KEYS,
     NAMES,
@@ -238,6 +239,21 @@ class Sender(QThread):
             )
 
 
+class LinuxSettingsWorker(QThread):
+    result = pyqtSignal(bool, object)
+
+    def __init__(self, backend, changes):
+        super().__init__()
+        self.backend = backend
+        self.changes = changes
+
+    def run(self):
+        try:
+            self.result.emit(True, self.backend.apply(self.changes))
+        except Exception as error:
+            self.result.emit(False, str(error))
+
+
 class Recorder(QDialog):
     def __init__(self, parent, delay):
         super().__init__(parent)
@@ -406,11 +422,18 @@ class EventDialog(QDialog):
 
 
 class Window(QWidget):
-    def __init__(self, data_path):
+    def __init__(self, data_path, linux_settings=None):
         super().__init__()
         self.loading = True
         self.worker = None
         self.drag = None
+        self.linux_settings = (
+            linux_settings if linux_settings is not None else GnomeMouseSettings()
+        )
+        self.linux_worker = None
+        self.linux_values = {}
+        self.linux_dirty = set()
+        self.linux_writable = set()
         self.setWindowTitle("Fury V2 Linux")
         self.setWindowIcon(QIcon(str(ROOT / "assets/icon.svg")))
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -512,6 +535,7 @@ class Window(QWidget):
         self.tab(0)
         self.detect()
         self.loading = False
+        self.read_linux_settings()
 
     @property
     def p(self):
@@ -605,6 +629,10 @@ class Window(QWidget):
             if n == 3:
                 self.note(
                     "Создай макрос, назначь кнопку, затем нажми «Записать в мышь»."
+                )
+            elif n == 1:
+                self.note(
+                    "«Применить» — DPI и частота мыши. Для системных настроек справа: «Применить в Linux»."
                 )
             else:
                 self.note(
@@ -869,23 +897,167 @@ class Window(QWidget):
             rate_group.addButton(r)
             r.clicked.connect(lambda _, v=hz: self.change("rate", v, "performance"))
             self.rates[hz] = r
-        for key, title, y, lo, hi in [
-            ("cursor_speed", "Скорость мыши", 105, 1, 11),
-            ("scroll_speed", "Скорость прокрутки", 205, 1, 11),
-            ("double_click", "Скорость двойного щелчка", 305, 0, 10),
-            ("response", "Время отклика кнопки, мс", 405, 1, 100),
-        ]:
-            s = self.slider(right, key, title, 15, y, 390, lo, hi, enabled=False)
-            s.setToolTip("Параметр ещё не перенесён в Linux; мыши не отправляется.")
         label(
             right,
-            "Серые настройки пока недоступны в Linux-версии.",
-            15,
-            510,
-            395,
-            24,
-            "font-size:12px;color:#999;",
+            "Настройки Linux · все мыши",
+            1,
+            97,
+            422,
+            34,
+            "background:#353535;padding-left:14px;",
         )
+        label(right, "Скорость указателя", 15, 140, 280, 24)
+        self.linux_speed = place(
+            RedSlider(Qt.Orientation.Horizontal, right), 15, 170, 310, 22
+        )
+        self.linux_speed.setRange(-100, 100)
+        self.linux_speed_value = label(right, "0", 340, 164, 65, 30)
+        self.linux_speed.setToolTip("0 — обычная скорость Linux; это не DPI мыши.")
+        label(right, "Ускорение", 15, 207, 155, 30)
+        self.linux_acceleration = place(QComboBox(right), 180, 207, 225, 32)
+        for value, title in ACCELERATION.items():
+            self.linux_acceleration.addItem(title, value)
+        label(right, "Двойной щелчок: интервал", 15, 251, 255, 30)
+        self.linux_double_click = place(QSpinBox(right), 280, 251, 125, 32)
+        self.linux_double_click.setRange(50, 2000)
+        self.linux_double_click.setSingleStep(50)
+        self.linux_double_click.setSuffix(" мс")
+        self.linux_double_click.setToolTip(
+            "Максимальный интервал между двумя кликами. Не создаёт второй клик; игры могут использовать свой интервал."
+        )
+        self.linux_controls = {
+            "speed": self.linux_speed,
+            "accel-profile": self.linux_acceleration,
+            "double-click": self.linux_double_click,
+        }
+        self.linux_speed.valueChanged.connect(
+            lambda v: self.linux_speed_value.setText(str(v))
+        )
+        self.linux_speed.valueChanged.connect(lambda _: self.linux_edited("speed"))
+        self.linux_acceleration.currentIndexChanged.connect(
+            lambda _: self.linux_edited("accel-profile")
+        )
+        self.linux_double_click.valueChanged.connect(
+            lambda _: self.linux_edited("double-click")
+        )
+        self.linux_read_btn = button(
+            right, "Прочитать из Linux", 15, 300, 190, 32, self.read_linux_settings
+        )
+        self.linux_apply_btn = button(
+            right, "Применить в Linux", 215, 300, 190, 32, self.apply_linux_settings
+        )
+        self.linux_status = label(
+            right, "", 15, 340, 390, 58, "color:#aaa;font-size:12px;"
+        )
+        self.linux_status.setWordWrap(True)
+        label(right, "Скорость прокрутки", 15, 410, 250, 25, "color:#777;")
+        unavailable_scroll = place(QSpinBox(right), 280, 410, 125, 28)
+        unavailable_scroll.setSpecialValueText("Недоступно")
+        unavailable_scroll.setValue(0)
+        unavailable_scroll.setEnabled(False)
+        label(
+            right,
+            "GNOME не предоставляет эту настройку.",
+            15,
+            438,
+            390,
+            22,
+            "color:#888;font-size:12px;",
+        )
+        label(right, "Задержка кнопок (debounce)", 15, 471, 270, 25, "color:#777;")
+        unavailable_debounce = place(QSpinBox(right), 280, 471, 125, 28)
+        unavailable_debounce.setSpecialValueText("Недоступно")
+        unavailable_debounce.setValue(0)
+        unavailable_debounce.setEnabled(False)
+        label(
+            right,
+            "Команда для этой прошивки ещё не подтверждена.",
+            15,
+            502,
+            395,
+            22,
+            "color:#888;font-size:12px;",
+        )
+        self.linux_apply_btn.setEnabled(False)
+
+    def _show_linux_values(self, values):
+        self.linux_values = dict(values)
+        for control in self.linux_controls.values():
+            control.blockSignals(True)
+        self.linux_speed.setValue(round(values["speed"] * 100))
+        self.linux_speed_value.setText(str(round(values["speed"] * 100)))
+        self.linux_acceleration.setCurrentIndex(
+            self.linux_acceleration.findData(values["accel-profile"])
+        )
+        interval = values["double-click"]
+        self.linux_double_click.setRange(min(50, interval), max(2000, interval))
+        self.linux_double_click.setValue(interval)
+        for control in self.linux_controls.values():
+            control.blockSignals(False)
+        self.linux_dirty.clear()
+        self._enable_linux_controls()
+
+    def _enable_linux_controls(self):
+        busy = bool(self.linux_worker and self.linux_worker.isRunning())
+        for key, control in self.linux_controls.items():
+            control.setEnabled(not busy and key in self.linux_writable)
+        self.linux_read_btn.setEnabled(not busy)
+        self.linux_apply_btn.setEnabled(not busy and bool(self.linux_dirty))
+
+    def read_linux_settings(self):
+        if self.linux_worker and self.linux_worker.isRunning():
+            return
+        try:
+            values = self.linux_settings.read()
+            self.linux_writable = self.linux_settings.writable()
+            self._show_linux_values(values)
+            self.linux_status.setText(
+                "Прочитано из Linux. Изменения действуют на все мыши."
+                if len(self.linux_writable) == 3
+                else "Прочитано из Linux. Часть настроек заблокирована администратором."
+            )
+        except SettingsError as error:
+            self.linux_writable.clear()
+            self.linux_dirty.clear()
+            self._enable_linux_controls()
+            self.linux_status.setText(str(error))
+
+    def linux_edited(self, key):
+        if key not in self.linux_writable:
+            return
+        self.linux_dirty.add(key)
+        self._enable_linux_controls()
+        self.linux_status.setText(
+            "Ещё не применено. Нажми «Применить в Linux». Это настройки всех мышей в сессии."
+        )
+
+    def apply_linux_settings(self):
+        if not self.linux_dirty or (
+            self.linux_worker and self.linux_worker.isRunning()
+        ):
+            return
+        values = {
+            "speed": self.linux_speed.value() / 100,
+            "accel-profile": self.linux_acceleration.currentData(),
+            "double-click": self.linux_double_click.value(),
+        }
+        changes = {key: values[key] for key in self.linux_dirty}
+        self.linux_worker = LinuxSettingsWorker(self.linux_settings, changes)
+        self.linux_worker.result.connect(self.linux_settings_sent)
+        self.linux_worker.finished.connect(self._enable_linux_controls)
+        self.linux_worker.start()
+        self._enable_linux_controls()
+        self.linux_status.setText("Применяю настройки Linux…")
+
+    def linux_settings_sent(self, ok, result):
+        if ok:
+            self._show_linux_values(result)
+            self.linux_status.setText(
+                "Настройки применены в Linux и прочитаны обратно. Действуют на все мыши."
+            )
+        else:
+            self.linux_status.setText(str(result))
+            QMessageBox.warning(self, "Настройки Linux", str(result))
 
     def dpi_slide(self, index, v):
         self.dpi_values[index].blockSignals(True)
@@ -1270,7 +1442,7 @@ class Window(QWidget):
         elif len(dev) > 1:
             text = "●  Подключено несколько Fury V2 — оставь одну для настройки"
         elif dev[0]["accessible"]:
-            text = "●  Fury V2 подключена  ·  USB доступен  ·  Linux 0.2"
+            text = "●  Fury V2 подключена  ·  USB доступен  ·  Linux 0.3.0"
         else:
             text = "●  Fury V2 подключена  ·  Для настройки нужен доступ к USB"
         self.device_label.setText(text)
@@ -1336,6 +1508,10 @@ class Window(QWidget):
             QMessageBox.warning(self, "Fury V2", message)
 
     def closeEvent(self, e):
+        if self.linux_worker and self.linux_worker.isRunning():
+            self.note("Подожди завершения настройки Linux.")
+            e.ignore()
+            return
         if self.worker and self.worker.isRunning():
             self.note("Подожди завершения передачи настроек.")
             e.ignore()

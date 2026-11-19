@@ -63,3 +63,43 @@ assumed compatible with Fury V2.
 
 Successful USB transfer is not verification that firmware applied a setting.
 If a transfer fails, a prefix of the transaction may already be on the device.
+
+## Corrected action semantics in 0.2.1
+
+The original action-label routine (0x4083e0; selector 0x40900c, jump table
+0x408efc) identifies action 6 as dpi_cycle_text, 7 as dpi_up_text,
+8 as dpi_down_text and 50 as light_mode_switch_text. The action table at
+0x426120 maps these to 07 00 03 00, 07 00 01 00, 07 00 02 00 and
+0b 00 00 00 respectively. Data.ini's default button bytes do not establish
+these meanings. Version 0.2 incorrectly labeled 07 00 01 00 as a DPI cycle
+and 08 00 03 00 as a lighting cycle. The regression fixture explicitly uses
+original action IDs 6 and 50 instead of deriving IDs from the Linux map.
+
+A user has confirmed a recorded Ctrl+Shift+C macro plays on their mouse.
+This does not yet verify hold/toggle modes, timing or persistence.
+
+After applying 0.2.1, the user confirmed DPI wraps from the sixth stage
+back to the first and the lighting button cycles effects again.
+
+## Double-click assignment in 0.3.0
+
+The action-label jump table identifies action 9 as double_click_text.
+Its entry in the original action table is 0a f0 32 02. The Linux action
+`double_click` uses these bytes. The double-click regression fixture is
+captured using original action ID 9 independently of the Linux action map,
+with the corrected DPI and lighting cycles still present in the table.
+Physical double-click playback is not yet confirmed. GNOME's double-click
+interval is a separate desktop preference and does not generate input.
+
+## Desktop preferences in 0.3.0
+
+`linux_settings.py` accesses the installed schema
+org.gnome.desktop.peripherals.mouse through gsettings: speed [-1,1],
+accel-profile {default,flat,adaptive}, double-click (milliseconds).
+Only explicitly edited keys are written, then read back. On failure the
+backend attempts rollback to the immediately preceding snapshot. This is
+not a transaction across multiple processes: external writers may race.
+No root privileges, USB writes or synthetic input are involved. The UI
+uses a separate Apply in Linux action and keeps desktop values outside
+hardware profiles. Non-GNOME desktops are not enabled just because the
+schema happens to be installed.
